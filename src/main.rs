@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::Path;
-use std::io::{self, Write};
+use std::io::{self, Write, stdin, stdout};
 use pqcrypto_sphincsplus::sphincssha2128fsimple::{
 	keypair, detached_sign, verify_detached_signature,
 	PublicKey, SecretKey,
@@ -30,7 +30,6 @@ use std::env;
 
 
 // Variables globales
-pub static LAST_BC_TX: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 pub static WALLET_PK: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 pub static WALLET_SK: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 pub static WALLET_ADDRESS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
@@ -549,22 +548,208 @@ fn print_help() {
 	println!("  send <addr1> <amount1> [addr2 amount2 ...] - Send to multiple addresses");
 }
 
-fn input_thread(running: Arc<AtomicBool>, tx: mpsc::Sender<String>) {
-	use std::io::{stdin, stdout};
-	use std::sync::mpsc::Sender;
-	
-	while running.load(Ordering::Relaxed) {
-		let mut input = String::new();
-		print!("> ");
-		let _ = stdout().flush();
-		if stdin().read_line(&mut input).is_ok() {
-			let input = input.trim().to_string();
-			if !input.is_empty() {
-				let _ = tx.send(input);
-			}
-		}
-		std::thread::sleep(std::time::Duration::from_millis(100));
-	}
+fn input_thread(
+    running: Arc<AtomicBool>,
+    conn: Option<Connection>,
+    pk: PublicKey,
+    sk: SecretKey,
+    address: String,
+    client: Client,
+) {
+    while running.load(Ordering::Relaxed) {
+        let mut input = String::new();
+        print!("> ");
+        let _ = stdout().flush();
+        
+        if stdin().read_line(&mut input).is_ok() {
+            let input = input.trim().to_string();
+            if !input.is_empty() {
+                let parts: Vec<&str> = input.split_whitespace().collect();
+                match parts.as_slice() {
+                    ["help"] => print_help(),
+                    ["balance"] => {
+                        if let Some(ref conn) = conn {
+                            let balance = get_balance(conn);
+                            println!("\nBalance: {} OMI", balance as f64 / 100000000.0);
+                            let ubalance = get_unconfirmed_balance(&conn);
+                            println!("Unconfirmed Balance: {} OMI", ubalance as f64 / 100000000.0);
+                        } else {
+                            println!("No wallet database available");
+                        }
+                    }
+                    ["unspent_utxo"] => {
+                        if let Some(ref conn) = conn {
+                            match get_unspent_utxos(conn) {
+                                Ok(utxos) => {
+                                    if utxos.is_empty() {
+                                        println!("\nNo unspent transaction outputs found");
+                                    } else {
+                                        println!("\nUnspent Transaction Outputs:");
+                                        for utxo in utxos {
+                                            println!(
+                                                "TXID: {}, Vout: {}, Amount: {} OMI, Status: {}",
+                                                utxo.txid,
+                                                utxo.vout,
+                                                utxo.amount as f64 / 100000000.0,
+                                                utxo.status
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => println!("\nError fetching UTXOs: {}", e),
+                            }
+                        } else {
+                            println!("\nNo wallet database available");
+                        }
+                    }
+                    ["send", addresses @ ..] => {
+                        if addresses.len() % 2 != 0 || addresses.is_empty() {
+                            println!("\nInvalid send command. Usage: send <addr1> <amount1> [addr2 amount2 ...]");
+                            continue;
+                        }
+
+                        if let Some(ref conn) = conn {
+                            let mut dest_addresses = Vec::new();
+                            let mut amounts = Vec::new();
+                            let mut total_amount = 0u64;
+
+                            for chunk in addresses.chunks(2) {
+                                let address = chunk[0];
+                                
+                                if address.len() != 64 || address.chars().any(|c| !c.is_ascii_hexdigit()) {
+                                    println!("\nInvalid address: {} (must be 64-character hex string)", address);
+                                    continue;
+                                }
+                                
+                                let amount_omi: f64 = match chunk[1].parse() {
+                                    Ok(amount) => amount,
+                                    Err(_) => {
+                                        println!("\nInvalid amount: {}", chunk[1]);
+                                        continue;
+                                    }
+                                };
+                                let amount = (amount_omi * 100000000.0).round() as u64;
+                                
+                                dest_addresses.push(address);
+                                amounts.push(amount);
+                                total_amount += amount;
+                            }
+
+                            if amounts.is_empty() {
+                                println!("\nNo valid amounts provided");
+                                continue;
+                            }
+
+                            match get_unspent_utxos(conn) {
+                                Ok(utxos) => {
+                                    let fee_per_input = 5000;
+                                    let fee_per_output = 2000;
+                                    
+                                    let output_count = dest_addresses.len() + 1;
+                                    let mut fee_estimate = fee_per_input + (output_count as u64 * fee_per_output);
+                                    
+                                    let (selected_utxos, total_inputs, actual_fee) = select_utxos(&utxos, total_amount, fee_per_input);
+                                    
+                                    if selected_utxos.is_empty() {
+                                        println!("\nNot enough funds or no UTXOs available");
+                                        continue;
+                                    }
+                                    
+                                    let exact_fee = (selected_utxos.len() as u64 * fee_per_input) + (output_count as u64 * fee_per_output);
+                                    
+                                    if total_inputs < total_amount + exact_fee {
+                                        println!("\nNot enough funds when including exact fees");
+                                        println!("- Needed: {} (amount) + {} (fees) = {}", 
+                                            total_amount, exact_fee, total_amount + exact_fee);
+                                        println!("- Available: {}", total_inputs);
+                                        continue;
+                                    }
+
+                                    let (inputs, outputs, fee) = build_transaction(
+                                        &selected_utxos,
+                                        amounts,
+                                        exact_fee,
+                                        dest_addresses,
+                                        &address,
+                                    );
+
+                                    println!("\nOutputs:");
+                                    for output in &outputs {
+                                        println!("- {} -> {} OMI", 
+                                            output.0, output.1 as f64 / 100000000.0);
+                                    }
+
+                                    println!("\nFee: {} OMI ({} inputs × {} + {} outputs × {})", 
+                                        fee as f64 / 100000000.0,
+                                        selected_utxos.len(), fee_per_input,
+                                        output_count, fee_per_output);
+
+                                    let mut raw_tx = RawTransaction {
+                                        inputcount: format!("{:02x}", inputs.len()),
+                                        inputs: inputs.iter().map(|(txid, vout, _)| {
+                                            INTXO {
+                                                txid: txid.clone(),
+                                                vout: *vout,
+                                                extrasize: "00".to_string(),
+                                                extra: "".to_string(),
+                                                sequence: 0xFFFFFFFF,
+                                            }
+                                        }).collect(),
+                                        outputcount: format!("{:02x}", outputs.len()),
+                                        outputs: outputs.clone(),
+                                        fee: exact_fee,
+                                        sigpub: encode(pk.as_bytes()),
+                                        signature: "".to_string(),
+                                    };
+                                    let tx_binary = bincode::serialize(&raw_tx)
+                                        .expect("Failed to serialize transaction");
+                                    let tx_hash = blake3::hash(&tx_binary);
+                                    let signature = detached_sign(tx_hash.as_bytes(), &sk);
+                                    let signature_hex = encode(signature.as_bytes());
+                                    raw_tx.signature = signature_hex;
+                                    let signed_tx_binary = bincode::serialize(&raw_tx)
+                                        .expect("Failed to serialize signed transaction");
+                                    let signed_tx_hex = encode(&signed_tx_binary);
+                                    println!("\nTransaction signed successfully");
+                                    println!("Transaction ID: {}", encode(signed_tx_hex.as_bytes()));
+                                    println!("\nBroadcasting transaction...");
+
+                                    let send_request = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": "pokio_wallet",
+                                        "method": "pokio_sendRawTransaction",
+                                        "params": [signed_tx_hex]
+                                    });
+                                    match client.post("http://localhost:40404/rpc")
+                                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                        .json(&send_request)
+                                        .send() {
+                                            Ok(resp) => {
+                                                if let Ok(response_text) = resp.text() {
+                                                    println!("\nTransaction sent successfully");
+                                                    for (txid, vout, _) in inputs {
+                                                        conn.execute(
+                                                            "UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
+                                                            params![txid, vout],
+                                                        ).expect("Failed to update input status");
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => println!("\nError sending transaction: {}", e),
+                                        }
+                                }
+                                Err(e) => println!("\nError fetching UTXOs: {}", e),
+                            }
+                        } else {
+                            println!("\nNo wallet database available");
+                        }
+                    }
+                    _ => println!("\nUnknown command. Type 'help' for available commands."),
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn check_confirm_utxos(conn: &Connection, client: &Client) {
@@ -806,12 +991,22 @@ fn main() {
 	} else {
 		(1, None)
 	};
-
-	let running = Arc::new(AtomicBool::new(true));
-	let (tx, rx) = mpsc::channel();
-	let input_running = running.clone();
 	
 	let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+	let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+	let input_conn = conn.as_ref().map(|c| {
+		let db_path = format!("wallets/{}.dat", wallet_name_opt.as_ref().unwrap());
+		Connection::open(db_path).expect("Failed to open database connection")
+	});
+    let input_pk = pk.clone();
+    let input_sk = sk.clone();
+    let input_address = address.clone();
+    let input_client = client.clone();
+    
+    let input_handle = thread::spawn(move || {
+        input_thread(r, input_conn, input_pk, input_sk, input_address, input_client);
+    });
 	
 	let args: Vec<String> = env::args().collect();
 	if args.iter().any(|arg| arg == "--rpc") {
@@ -819,203 +1014,8 @@ fn main() {
 			start_rpc_server().await;
 		});
 	}
-	
-	thread::spawn(move || {
-		input_thread(input_running, tx);
-	});
 
 	loop {
-		if let Ok(cmd) = rx.try_recv() {
-			let parts: Vec<&str> = cmd.split_whitespace().collect();
-			match parts.as_slice() {
-				["help"] => print_help(),
-				["balance"] => {
-					if let Some(ref conn) = conn {
-						let balance = get_balance(conn);
-						println!("\nBalance: {} OMI", balance as f64 / 100000000.0);
-						let ubalance = get_unconfirmed_balance(conn);
-						println!("Unconfirmed Balance: {} OMI", ubalance as f64 / 100000000.0);
-					} else {
-						println!("No wallet database available");
-					}
-				}
-				["unspent_utxo"] => {
-					if let Some(ref conn) = conn {
-						match get_unspent_utxos(conn) {
-							Ok(utxos) => {
-								if utxos.is_empty() {
-									println!("\nNo unspent transaction outputs found");
-								} else {
-									println!("\nUnspent Transaction Outputs:");
-									for utxo in utxos {
-										println!(
-											"TXID: {}, Vout: {}, Amount: {} OMI, Status: {}",
-											utxo.txid,
-											utxo.vout,
-											utxo.amount as f64 / 100000000.0,
-											utxo.status
-										);
-									}
-								}
-							}
-							Err(e) => println!("\nError fetching UTXOs: {}", e),
-						}
-					} else {
-						println!("\nNo wallet database available");
-					}
-				}
-				["send", addresses @ ..] => {
-					if addresses.len() % 2 != 0 || addresses.is_empty() {
-						println!("\nInvalid send command. Usage: send <addr1> <amount1> [addr2 amount2 ...]");
-						continue;
-					}
-
-					if let Some(ref conn) = conn {
-						let mut dest_addresses = Vec::new();
-						let mut amounts = Vec::new();
-						let mut total_amount = 0u64;
-
-						for chunk in addresses.chunks(2) {
-							let address = chunk[0];
-							
-							if address.len() != 64 || address.chars().any(|c| !c.is_ascii_hexdigit()) {
-								println!("\nInvalid address: {} (must be 64-character hex string)", address);
-								continue;
-							}
-							
-							let amount_omi: f64 = match chunk[1].parse() {
-								Ok(amount) => amount,
-								Err(_) => {
-									println!("\nInvalid amount: {}", chunk[1]);
-									continue;
-								}
-							};
-							let amount = (amount_omi * 100000000.0).round() as u64;
-							
-							dest_addresses.push(address);
-							amounts.push(amount);
-							total_amount += amount;
-						}
-
-						if amounts.is_empty() {
-							println!("\nNo valid amounts provided");
-							continue;
-						}
-
-						match get_unspent_utxos(conn) {
-							Ok(utxos) => {
-								let fee_per_input = 5000;
-								let fee_per_output = 2000;
-								
-								let output_count = dest_addresses.len() + 1;
-								let mut fee_estimate = fee_per_input + (output_count as u64 * fee_per_output);
-								
-								let (selected_utxos, total_inputs, actual_fee) = select_utxos(&utxos, total_amount, fee_per_input);
-								
-								if selected_utxos.is_empty() {
-									println!("\nNot enough funds or no UTXOs available");
-									continue;
-								}
-								
-								let exact_fee = (selected_utxos.len() as u64 * fee_per_input) + (output_count as u64 * fee_per_output);
-								
-								if total_inputs < total_amount + exact_fee {
-									println!("\nNot enough funds when including exact fees");
-									println!("- Needed: {} (amount) + {} (fees) = {}", 
-										total_amount, exact_fee, total_amount + exact_fee);
-									println!("- Available: {}", total_inputs);
-									continue;
-								}
-
-								let (inputs, outputs, fee) = build_transaction(
-									&selected_utxos,
-									amounts,
-									exact_fee,
-									dest_addresses,
-									&address,
-								);
-
-								println!("\nOutputs:");
-								for output in &outputs {
-									println!("- {} -> {} OMI", 
-										output.0, output.1 as f64 / 100000000.0);
-								}
-
-								println!("\nFee: {} OMI ({} inputs × {} + {} outputs × {})", 
-									fee as f64 / 100000000.0,
-									selected_utxos.len(), fee_per_input,
-									output_count, fee_per_output);
-
-								let mut raw_tx = RawTransaction {
-									inputcount: format!("{:02x}", inputs.len()),
-									inputs: inputs.iter().map(|(txid, vout, _)| {
-										INTXO {
-											txid: txid.clone(),
-											vout: *vout,
-											extrasize: "00".to_string(),
-											extra: "".to_string(),
-											sequence: 0xFFFFFFFF,
-										}
-									}).collect(),
-									outputcount: format!("{:02x}", outputs.len()),
-									outputs: outputs.clone(),
-									fee: exact_fee,
-									sigpub: encode(pk.as_bytes()),
-									signature: "".to_string(),
-								};
-								let tx_binary = bincode::serialize(&raw_tx)
-									.expect("Failed to serialize transaction");
-								let tx_hash = blake3::hash(&tx_binary);
-								let signature = detached_sign(tx_hash.as_bytes(), &sk);
-								let signature_hex = encode(signature.as_bytes());
-								raw_tx.signature = signature_hex;
-								let signed_tx_binary = bincode::serialize(&raw_tx)
-									.expect("Failed to serialize signed transaction");
-								let signed_tx_hex = encode(&signed_tx_binary);
-								println!("\nTransaction signed successfully");
-								println!("Transaction ID: {}", encode(tx_hash.as_bytes()));
-								println!("\nBroadcasting transaction...");
-								
-								{
-									let tx_hash = blake3::hash(signed_tx_hex.as_bytes());
-									let mut tx = LAST_BC_TX.lock().unwrap();
-									*tx = hex::encode(tx_hash.as_bytes()).to_string();
-								}
-
-								let send_request = json!({
-									"jsonrpc": "2.0",
-									"id": "pokio_wallet",
-									"method": "pokio_sendRawTransaction",
-									"params": [signed_tx_hex]
-								});
-								match client.post("http://localhost:40404/rpc")
-									.header(header::CONTENT_TYPE, "application/json")
-									.json(&send_request)
-									.send() {
-										Ok(resp) => {
-											if let Ok(response_text) = resp.text() {
-												println!("\nTransaction sent successfully");
-												for (txid, vout, _) in inputs {
-													conn.execute(
-														"UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
-														params![txid, vout],
-													).expect("Failed to update input status");
-												}
-											}
-										},
-										Err(e) => println!("\nError sending transaction: {}", e),
-									}
-							}
-							Err(e) => println!("\nError fetching UTXOs: {}", e),
-						}
-					} else {
-						println!("\nNo wallet database available");
-					}
-				}
-				_ => println!("\nUnknown command. Type 'help' for available commands."),
-			}
-		}
-
 		if let Some(ref conn) = conn {
 			if last_block % 10 == 1 {
 				check_confirm_utxos(conn, &client);
