@@ -107,9 +107,33 @@ async fn start_rpc_server() {
 				
 				let mut t_amount: u64 = 0;
 				let mut txh: String = "".to_string();
+				let mut response = format!(r#"{{"jsonrpc": "2.0","id": "0","error": "-3200"}}"#);
 				if let Some(start) = request.find('{') {
 					let json_body = &request[start..];
 					if let Ok(req) = serde_json::from_str::<Value>(json_body) {
+						if req["method"] == "getbalance" {
+							
+							let wallet_name_global = WALLET_N.lock().unwrap();
+							let w_address = WALLET_ADDRESS.lock().unwrap();
+								
+							let db_path = format!("wallets/{}.dat", wallet_name_global);
+							let conn = match Connection::open(db_path) {
+								Ok(c) => c,
+								Err(e) => {
+									eprintln!("Error opening DB: {}", e);
+									return;
+								}
+							};
+							
+							let balance = get_balance(&conn);
+                            let ubalance = get_unconfirmed_balance(&conn);
+							
+							response = format!(
+								r#"{{"jsonrpc": "2.0","id": "0","result": {{"balance": {},"blocks_to_unlock": 0,"multisig_import_needed": false,"per_subaddress": [],"time_to_unlock": 0,"unlocked_balance": {}}}}}"#,
+								balance, ubalance
+							);
+							
+						}
 						if req["method"] == "transfer" {
 							if let Some(destinations) = req["params"]["destinations"].as_array() {
 								let mut cmd = String::from("");
@@ -125,7 +149,7 @@ async fn start_rpc_server() {
 								}
 								println!("\n[RPC] Injecting command: {}", cmd);
 								
-								let addresses: Vec<&str> = cmd.split_whitespace().collect(); // Split en partes
+								let addresses: Vec<&str> = cmd.split_whitespace().collect();
 
 								if addresses.len() % 2 != 0 || addresses.is_empty() {
 									println!("\nInvalid send command. Usage: send <addr1> <amount1> [addr2 amount2 ...]");
@@ -252,13 +276,10 @@ async fn start_rpc_server() {
 												.expect("Failed to serialize signed transaction");
 											let signed_tx_hex = encode(&signed_tx_binary);
 											println!("\nTransaction signed successfully");
-											println!("Transaction ID: {}", encode(tx_hash.as_bytes()));
-											println!("\nBroadcasting transaction...");
-											
 											let th = blake3::hash(signed_tx_hex.as_bytes());
 											txh = hex::encode(th.as_bytes());
-											
-											println!("Update Transaction ID: {}", txh);
+											println!("Transaction ID: {}", txh);
+											println!("\nBroadcasting transaction...");
 
 											let send_request = json!({
 												"jsonrpc": "2.0",
@@ -278,12 +299,22 @@ async fn start_rpc_server() {
 												.send() {
 													Ok(resp) => {
 														if let Ok(response_text) = resp.text() {
-															println!("\nTransaction sent successfully");
-															for (txid, vout, _) in inputs {
-																conn.execute(
-																	"UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
-																	params![txid, vout],
-																).expect("Failed to update input status");
+															if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+																if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+																	if result == txh {
+																		response = format!(
+																			r#"{{"jsonrpc": "2.0","id": "0","result": {{"amount": {},"fee": 1000000,"multisig_txset": "","tx_blob": "","tx_hash": "{}","tx_key": "{}","tx_metadata": "","unsigned_txset": ""}}}}"#,
+																			t_amount, txh, txh
+																		);
+																		println!("\nTransaction sent successfully");
+																		for (txid, vout, _) in inputs {
+																			conn.execute(
+																				"UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
+																				params![txid, vout],
+																			).expect("Failed to update input status");
+																		}
+																	}
+																}
 															}
 														}
 													},
@@ -296,13 +327,8 @@ async fn start_rpc_server() {
 						}
 					}
 				}
-
+				println!("{:?}", response);
 				
-				let response = format!(
-					r#"{{"jsonrpc": "2.0","id": "0","result": {{"amount": {},"fee": 1000000,"multisig_txset": "","tx_blob": "","tx_hash": "{}","tx_key": "{}","tx_metadata": "","unsigned_txset": ""}}}}"#,
-					t_amount, txh, txh
-				);
-
 				let http_response = format!(
 					"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
 					response.len(),
@@ -357,6 +383,16 @@ fn get_last_block(conn: &Connection) -> u64 {
 	.ok()
 	.and_then(|s| s.parse().ok())
 	.unwrap_or(1)
+}
+
+fn refresh_utxos(conn: &Connection) {
+	let _ = conn.execute(
+		"DELETE FROM inputs", []
+	);
+	
+	let _ = conn.execute(
+		"UPDATE meta SET value = 1 WHERE key = 'last_block'", []
+	);
 }
 
 fn update_last_block(conn: &Connection, height: u64) {
@@ -544,6 +580,7 @@ fn print_help() {
 	println!("Available commands:");
 	println!("  help		  - Show this help message");
 	println!("  balance	   - Show current wallet balance");
+	println!("  refresh	   - Refresh wallet balances and inputs from scratch");
 	println!("  unspent_utxo  - Show all unspent transaction outputs");
 	println!("  send <addr1> <amount1> [addr2 amount2 ...] - Send to multiple addresses");
 }
@@ -571,11 +608,17 @@ fn input_thread(
                         if let Some(ref conn) = conn {
                             let balance = get_balance(conn);
                             println!("\nBalance: {} OMI", balance as f64 / 100000000.0);
-                            let ubalance = get_unconfirmed_balance(&conn);
+                            let ubalance = get_unconfirmed_balance(conn);
                             println!("Unconfirmed Balance: {} OMI", ubalance as f64 / 100000000.0);
                         } else {
                             println!("No wallet database available");
                         }
+                    }
+					["refresh"] => {
+                        if let Some(ref conn) = conn {
+                            let _ = refresh_utxos(conn);
+                            println!("Database cleared. Syncing...");
+						}
                     }
                     ["unspent_utxo"] => {
                         if let Some(ref conn) = conn {
@@ -711,7 +754,9 @@ fn input_thread(
                                         .expect("Failed to serialize signed transaction");
                                     let signed_tx_hex = encode(&signed_tx_binary);
                                     println!("\nTransaction signed successfully");
-                                    println!("Transaction ID: {}", encode(signed_tx_hex.as_bytes()));
+									let th = blake3::hash(signed_tx_hex.as_bytes());
+									let txh = hex::encode(th.as_bytes());
+                                    println!("Transaction ID: {}", txh);
                                     println!("\nBroadcasting transaction...");
 
                                     let send_request = json!({
@@ -720,21 +765,35 @@ fn input_thread(
                                         "method": "pokio_sendRawTransaction",
                                         "params": [signed_tx_hex]
                                     });
-                                    match client.post("http://localhost:40404/rpc")
-                                        .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                        .json(&send_request)
-                                        .send() {
-                                            Ok(resp) => {
-                                                if let Ok(response_text) = resp.text() {
-                                                    println!("\nTransaction sent successfully");
-                                                    for (txid, vout, _) in inputs {
-                                                        conn.execute(
-                                                            "UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
-                                                            params![txid, vout],
-                                                        ).expect("Failed to update input status");
-                                                    }
-                                                }
-                                            },
+									match client.post("http://localhost:40404/rpc")
+										.header(header::CONTENT_TYPE, "application/json")
+										.json(&send_request)
+										.send() {
+											Ok(resp) => {
+												if let Ok(response_text) = resp.text() {
+													if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+														if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+															if result == txh {
+																println!("\nTransaction sent successfully");
+																for (txid, vout, _) in inputs {
+																	conn.execute(
+																		"UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
+																		params![txid, vout],
+																	).expect("Failed to update input status");
+																}
+															} else {
+																println!("\nError sending transaction");
+															}
+														} else {
+															println!("\nError sending transaction");
+														}
+													} else {
+														println!("\nError sending transaction");
+													}
+												}  else {
+													println!("\nError sending transaction");
+												}
+											},
                                             Err(e) => println!("\nError sending transaction: {}", e),
                                         }
                                 }
@@ -814,7 +873,8 @@ fn check_confirm_utxos(conn: &Connection, client: &Client) {
 	}
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
 	println!("\nOMINIRA WALLET 1.0 - SPHINCS+\n");
 	let choices = vec![
 		"Create new wallet",
@@ -1014,24 +1074,18 @@ fn main() {
 			start_rpc_server().await;
 		});
 	}
-
+	let mut xchk: u64 = 0;
 	loop {
+		
 		if let Some(ref conn) = conn {
-			if last_block % 10 == 1 {
-				check_confirm_utxos(conn, &client);
-			}
+			last_block = get_last_block(conn);
 		}
 		
 		if let Some(ref conn) = conn {
-			if last_block % 10 == 4 {
+			if xchk % 6 == 0 {
 				check_confirm_utxos(conn, &client);
 			}
-		}
-		
-		if let Some(ref conn) = conn {
-			if last_block % 10 == 8 {
-				check_confirm_utxos(conn, &client);
-			}
+			xchk += 1;
 		}
 
 		let request = json!({
@@ -1115,10 +1169,10 @@ fn main() {
 				}
 			}
 			Err(_) => {
-				std::thread::sleep(std::time::Duration::from_secs(5));
+				std::thread::sleep(std::time::Duration::from_secs(30));
 			}
 		}
 
-		std::thread::sleep(std::time::Duration::from_secs(1));
+		std::thread::sleep(std::time::Duration::from_secs(5));
 	}
 }
