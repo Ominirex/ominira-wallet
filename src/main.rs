@@ -26,6 +26,8 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::env;
+
 
 // Variables globales
 pub static LAST_BC_TX: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
@@ -91,6 +93,228 @@ struct UnspentUTXO {
 	status: String,
 }
 
+async fn start_rpc_server() {
+	let listener = TcpListener::bind("127.0.0.1:40407").await.expect("Cannot bind RPC port");
+	println!("\nListening for RPC on http://127.0.0.1:40407/rpc");
+
+	loop {
+		if let Ok((mut stream, _)) = listener.accept().await {
+			tokio::spawn(async move {
+				let mut buffer = [0; 1024];
+				let n = stream.read(&mut buffer).await.unwrap_or(0);
+				let request = String::from_utf8_lossy(&buffer[..n]);
+				
+				println!("{:?}", request);
+				
+				let mut t_amount: u64 = 0;
+				let mut txh: String = "".to_string();
+				if let Some(start) = request.find('{') {
+					let json_body = &request[start..];
+					if let Ok(req) = serde_json::from_str::<Value>(json_body) {
+						if req["method"] == "transfer" {
+							if let Some(destinations) = req["params"]["destinations"].as_array() {
+								let mut cmd = String::from("");
+								for dest in destinations {
+									if let (Some(addr), Some(amount)) = (
+										dest.get("address").and_then(|a| a.as_str()),
+										dest.get("amount").and_then(|a| a.as_u64()),
+									) {
+										t_amount += amount;
+										let amount_omi = amount as f64 / 100_000_000.0;
+										cmd.push_str(&format!(" {} {:.8}", addr, amount_omi));
+									}
+								}
+								println!("\n[RPC] Injecting command: {}", cmd);
+								
+								let addresses: Vec<&str> = cmd.split_whitespace().collect(); // Split en partes
+
+								if addresses.len() % 2 != 0 || addresses.is_empty() {
+									println!("\nInvalid send command. Usage: send <addr1> <amount1> [addr2 amount2 ...]");
+								}
+								
+								
+								let wallet_name_global = WALLET_N.lock().unwrap();
+								let pk = WALLET_PK.lock().unwrap();
+								let sk = WALLET_SK.lock().unwrap();
+								let w_address = WALLET_ADDRESS.lock().unwrap();
+								
+								let db_path = format!("wallets/{}.dat", wallet_name_global);
+								let conn = match Connection::open(db_path) {
+									Ok(c) => c,
+									Err(e) => {
+										eprintln!("Error opening DB: {}", e);
+										return;
+									}
+								};
+								//if let Some(ref conn) = conn {
+									let mut dest_addresses = Vec::new();
+									let mut amounts = Vec::new();
+									let mut total_amount = 0u64;
+
+									for chunk in addresses.chunks(2) {
+										let address = chunk[0];
+										
+										if address.len() != 64 || address.chars().any(|c| !c.is_ascii_hexdigit()) {
+											println!("\nInvalid address: {} (must be 64-character hex string)", address);
+											//continue;
+										}
+										
+										let amount: f64 = match chunk[1].parse::<f64>() {
+											Ok(num) => num,
+											Err(_) => {
+												println!("\nInvalid amount: {}", chunk[1]);
+												0.0
+											}
+										};
+										let f_amount: f64 = amount * 100000000.0;
+										let i_amount: u64 = f_amount as u64;
+										dest_addresses.push(address);
+										amounts.push(i_amount);
+										total_amount += i_amount;
+									}
+
+									if amounts.is_empty() {
+										println!("\nNo valid amounts provided");
+										//continue;
+									}
+
+									match get_unspent_utxos(&conn) {
+										Ok(utxos) => {
+											let fee_per_input = 5000;
+											let fee_per_output = 2000;
+											
+											let output_count = dest_addresses.len() + 1;
+											let mut fee_estimate = fee_per_input + (output_count as u64 * fee_per_output);
+											
+											let (selected_utxos, total_inputs, actual_fee) = select_utxos(&utxos, total_amount, fee_per_input);
+											
+											if selected_utxos.is_empty() {
+												println!("\nNot enough funds or no UTXOs available");
+												//continue;
+											}
+											
+											let exact_fee = (selected_utxos.len() as u64 * fee_per_input) + (output_count as u64 * fee_per_output);
+											
+											if total_inputs < total_amount + exact_fee {
+												println!("\nNot enough funds when including exact fees");
+												println!("- Needed: {} (amount) + {} (fees) = {}", 
+													total_amount, exact_fee, total_amount + exact_fee);
+												println!("- Available: {}", total_inputs);
+												//pcontinue;
+											}
+
+											let (inputs, outputs, fee) = build_transaction(
+												&selected_utxos,
+												amounts,
+												exact_fee,
+												dest_addresses,
+												&w_address,
+											);
+
+											println!("\nOutputs:");
+											for output in &outputs {
+												println!("- {} -> {} OMI", 
+													output.0, output.1 as f64 / 100000000.0);
+											}
+
+											println!("\nFee: {} OMI ({} inputs × {} + {} outputs × {})", 
+												fee as f64 / 100000000.0,
+												selected_utxos.len(), fee_per_input,
+												output_count, fee_per_output);
+
+											let mut raw_tx = RawTransaction {
+												inputcount: format!("{:02x}", inputs.len()),
+												inputs: inputs.iter().map(|(txid, vout, _)| {
+													INTXO {
+														txid: txid.clone(),
+														vout: *vout,
+														extrasize: "00".to_string(),
+														extra: "".to_string(),
+														sequence: 0xFFFFFFFF,
+													}
+												}).collect(),
+												outputcount: format!("{:02x}", outputs.len()),
+												outputs: outputs.clone(),
+												fee: exact_fee,
+												sigpub: pk.to_string(),
+												signature: "".to_string(),
+											};
+											let tx_binary = bincode::serialize(&raw_tx)
+												.expect("Failed to serialize transaction");
+											let tx_hash = blake3::hash(&tx_binary);
+											
+											let sk_bytes = decode(&*sk).expect("Invalid pubkey");
+											let ssk = SecretKey::from_bytes(&sk_bytes).expect("Invalid pubkey format");
+											
+											let signature = detached_sign(tx_hash.as_bytes(), &ssk);
+											let signature_hex = encode(signature.as_bytes());
+											raw_tx.signature = signature_hex;
+											let signed_tx_binary = bincode::serialize(&raw_tx)
+												.expect("Failed to serialize signed transaction");
+											let signed_tx_hex = encode(&signed_tx_binary);
+											println!("\nTransaction signed successfully");
+											println!("Transaction ID: {}", encode(tx_hash.as_bytes()));
+											println!("\nBroadcasting transaction...");
+											
+											let th = blake3::hash(signed_tx_hex.as_bytes());
+											txh = hex::encode(th.as_bytes());
+											
+											println!("Update Transaction ID: {}", txh);
+
+											let send_request = json!({
+												"jsonrpc": "2.0",
+												"id": "pokio_wallet",
+												"method": "pokio_sendRawTransaction",
+												"params": [signed_tx_hex]
+											});
+											
+											let client = Client::builder()
+												.gzip(true)
+												.build()
+												.expect("Error creating HTTP client");
+											
+											match client.post("http://localhost:40404/rpc")
+												.header(header::CONTENT_TYPE, "application/json")
+												.json(&send_request)
+												.send() {
+													Ok(resp) => {
+														if let Ok(response_text) = resp.text() {
+															println!("\nTransaction sent successfully");
+															for (txid, vout, _) in inputs {
+																conn.execute(
+																	"UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
+																	params![txid, vout],
+																).expect("Failed to update input status");
+															}
+														}
+													},
+													Err(e) => println!("\nError sending transaction: {}", e),
+												}
+										}
+										Err(e) => println!("\nError fetching UTXOs: {}", e),
+									}
+							}
+						}
+					}
+				}
+
+				
+				let response = format!(
+					r#"{{"jsonrpc": "2.0","id": "0","result": {{"amount": {},"fee": 1000000,"multisig_txset": "","tx_blob": "","tx_hash": "{}","tx_key": "{}","tx_metadata": "","unsigned_txset": ""}}}}"#,
+					t_amount, txh, txh
+				);
+
+				let http_response = format!(
+					"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+					response.len(),
+					response
+				);
+
+				let _ = stream.write_all(http_response.as_bytes()).await;
+			});
+		}
+	}
+}
 
 fn init_wallet_db(wallet_name: &str) -> Result<Connection> {
 	let db_path = format!("wallets/{}.dat", wallet_name);
@@ -588,6 +812,13 @@ fn main() {
 	let input_running = running.clone();
 	
 	let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+	
+	let args: Vec<String> = env::args().collect();
+	if args.iter().any(|arg| arg == "--rpc") {
+		tokio::spawn(async move {
+			start_rpc_server().await;
+		});
+	}
 	
 	thread::spawn(move || {
 		input_thread(input_running, tx);
