@@ -7,6 +7,7 @@ use pqcrypto_sphincsplus::sphincssha2128fsimple::{
 };
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait, DetachedSignature};
 use reqwest::blocking::Client;
+use reqwest::Client as NBClient;
 use reqwest::header;
 use serde_json::{json, Value};
 use serde::{Serialize, Deserialize};
@@ -28,8 +29,6 @@ use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::env;
 
-
-// Variables globales
 pub static WALLET_PK: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 pub static WALLET_SK: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 pub static WALLET_ADDRESS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
@@ -126,11 +125,12 @@ async fn start_rpc_server() {
 							};
 							
 							let balance = get_balance(&conn);
-                            let ubalance = get_unconfirmed_balance(&conn);
-							
+                            				let ubalance = get_unconfirmed_balance(&conn);
+							let tbalance = ubalance + balance;							
+
 							response = format!(
 								r#"{{"jsonrpc": "2.0","id": "0","result": {{"balance": {},"blocks_to_unlock": 0,"multisig_import_needed": false,"per_subaddress": [],"time_to_unlock": 0,"unlocked_balance": {}}}}}"#,
-								balance, ubalance
+								tbalance, balance
 							);
 							
 						}
@@ -289,7 +289,6 @@ async fn start_rpc_server() {
 											});
 											
 											let client = Client::builder()
-												.gzip(true)
 												.build()
 												.expect("Error creating HTTP client");
 											
@@ -578,11 +577,12 @@ fn list_wallets() -> io::Result<Vec<String>> {
 
 fn print_help() {
 	println!("Available commands:");
-	println!("  help		  - Show this help message");
-	println!("  balance	   - Show current wallet balance");
-	println!("  refresh	   - Refresh wallet balances and inputs from scratch");
-	println!("  unspent_utxo  - Show all unspent transaction outputs");
+	println!("  help          - Show this help message");
+	println!("  balance       - Show current wallet balance");
+	println!("  exit          - Exits the program");
+	println!("  refresh       - Refresh wallet balances and inputs from scratch");
 	println!("  send <addr1> <amount1> [addr2 amount2 ...] - Send to multiple addresses");
+	println!("  unspent_utxo  - Show all unspent transaction outputs");
 }
 
 fn input_thread(
@@ -591,7 +591,6 @@ fn input_thread(
     pk: PublicKey,
     sk: SecretKey,
     address: String,
-    client: Client,
 ) {
     while running.load(Ordering::Relaxed) {
         let mut input = String::new();
@@ -614,6 +613,10 @@ fn input_thread(
                             println!("No wallet database available");
                         }
                     }
+					["exit"] => {
+						println!("Closing wallet...");
+						std::process::exit(0);
+					},
 					["refresh"] => {
                         if let Some(ref conn) = conn {
                             let _ = refresh_utxos(conn);
@@ -758,6 +761,10 @@ fn input_thread(
 									let txh = hex::encode(th.as_bytes());
                                     println!("Transaction ID: {}", txh);
                                     println!("\nBroadcasting transaction...");
+									
+									let client = Client::builder()
+										.build()
+										.expect("Error creating HTTP client");
 
                                     let send_request = json!({
                                         "jsonrpc": "2.0",
@@ -811,7 +818,7 @@ fn input_thread(
     }
 }
 
-fn check_confirm_utxos(conn: &Connection, client: &Client) {
+fn check_confirm_utxos(conn: &Connection) {
 	let mut stmt = conn.prepare(
 		"SELECT txid, vout, block_height FROM inputs 
 		 WHERE status = 'unconfirmed' 
@@ -826,6 +833,10 @@ fn check_confirm_utxos(conn: &Connection, client: &Client) {
 			row.get::<_, u64>(2)?
 		))
 	}).unwrap();
+	
+	let client = Client::builder()
+		.build()
+		.expect("Error creating HTTP client");
 
 	for utxo in utxos {
 		let (txid, vout, block_height) = utxo.unwrap();
@@ -920,8 +931,7 @@ async fn main() {
 					std::process::exit(1);
 				}
 			}
-
-			// Almacenar en variables globales
+			
 			{
 				let mut pk_global = WALLET_PK.lock().unwrap();
 				*pk_global = encode(pk.as_bytes());
@@ -967,7 +977,6 @@ async fn main() {
 			let address_hash = blake3::hash(pk.as_bytes());
 			let address = encode(address_hash.as_bytes());
 
-			// Almacenar en variables globales
 			{
 				let mut pk_global = WALLET_PK.lock().unwrap();
 				*pk_global = encode(pk.as_bytes());
@@ -1013,7 +1022,6 @@ async fn main() {
 			let sk = SecretKey::from_bytes(&sk_bytes).expect("Failed to create SecretKey");
 			let pk = PublicKey::from_bytes(&pk_bytes).expect("Failed to create PublicKey");
 
-			// Almacenar en variables globales
 			{
 				let mut pk_global = WALLET_PK.lock().unwrap();
 				*pk_global = encode(pk.as_bytes());
@@ -1038,11 +1046,6 @@ async fn main() {
 	println!("- Recover key: {}+{}\n", encode(sk.as_bytes()), encode(pk.as_bytes()));
 	println!("\n- Address: {}\n", address);
 
-	let client = Client::builder()
-		.gzip(true)
-		.build()
-		.expect("Error creating HTTP client");
-
 	let (mut last_block, conn) = if let Some(wallet_name) = &wallet_name_opt {
 		let mut wallet_name_global = WALLET_N.lock().unwrap();
 		*wallet_name_global = wallet_name.clone();
@@ -1062,10 +1065,9 @@ async fn main() {
     let input_pk = pk.clone();
     let input_sk = sk.clone();
     let input_address = address.clone();
-    let input_client = client.clone();
     
     let input_handle = thread::spawn(move || {
-        input_thread(r, input_conn, input_pk, input_sk, input_address, input_client);
+        input_thread(r, input_conn, input_pk, input_sk, input_address);
     });
 	
 	let args: Vec<String> = env::args().collect();
@@ -1075,15 +1077,19 @@ async fn main() {
 		});
 	}
 	let mut xchk: u64 = 0;
+	
+	let clientb = NBClient::builder()
+		.build()
+		.expect("Error creating HTTP client");
+	
 	loop {
-		
 		if let Some(ref conn) = conn {
 			last_block = get_last_block(conn);
 		}
-		
+
 		if let Some(ref conn) = conn {
-			if xchk % 6 == 0 {
-				check_confirm_utxos(conn, &client);
+			if xchk % 7 == 6 {
+				check_confirm_utxos(conn);
 			}
 			xchk += 1;
 		}
@@ -1094,13 +1100,15 @@ async fn main() {
 			"method": "pokio_getBlocks",
 			"params": [last_block.to_string()]
 		});
-		let response = client.post("http://localhost:40404/rpc")
+
+		let response = clientb.post("http://localhost:40404/rpc")
 			.header(header::CONTENT_TYPE, "application/json")
 			.json(&request)
-			.send();
+			.send()
+			.await;
 		match response {
 			Ok(resp) => {
-				let response_text = match resp.text() {
+				let response_text = match resp.text().await {
 					Ok(text) => text,
 					Err(_) => continue,
 				};
@@ -1113,7 +1121,7 @@ async fn main() {
 				if let Some(result) = json_response.get("result") {
 					if let Some(blocks) = result.as_array() {
 						if blocks.is_empty() {
-							std::thread::sleep(std::time::Duration::from_secs(5));
+							std::thread::sleep(std::time::Duration::from_secs(1));
 							continue;
 						}
 						
@@ -1121,38 +1129,56 @@ async fn main() {
 							if let Ok(block) = serde_json::from_value::<Block>(block.clone()) {
 								for tx_hex in block.transactions.split('-') {
 									if let Ok(tx_bytes) = hex::decode(tx_hex.trim()) {
+										let b3_tx_hash = blake3::hash(tx_hex.as_bytes());
+										let tx_hash = hex::encode(b3_tx_hash.as_bytes());
 										if let Ok(raw_tx) = bincode::deserialize::<RawTransaction>(&tx_bytes) {
+											
+										let mut total_spent: i64 = 0;
+										let mut total_received: i64 = 0;
 
-											for (vout, (output_address, amount)) in raw_tx.outputs.iter().enumerate() {
-												if output_address == &address {
-													let b3_tx_hash = blake3::hash(tx_hex.as_bytes());
-													let tx_hash = hex::encode(b3_tx_hash.as_bytes());
-
-													println!("{}: {} OMI", tx_hash, *amount as f64 / 100000000.0);
-
-													if let Some(ref conn) = conn {
-														insert_input(
-															conn, 
-															&tx_hash, 
-															vout as u32, 
-															*amount, 
-															"unconfirmed",
-															Some(&block.hash),
-															Some(block.height),
-														);
-														let balance = get_balance(conn);
-													}
-												}
-											}
-
-											for input in &raw_tx.inputs {
-												if let Some(ref conn) = conn {
+										for input in &raw_tx.inputs {
+											if let Some(ref conn) = conn {
+												let mut stmt = conn
+													.prepare("SELECT amount FROM inputs WHERE txid = ?1 AND vout = ?2")
+													.expect("Failed to prepare statement");
+												let mut rows = stmt
+													.query(params![input.txid, input.vout])
+													.expect("Failed to execute query");
+												if let Some(row) = rows.next().expect("Failed to fetch row") {
+													let amount: i64 = row.get(0).expect("Failed to get amount");
+													total_spent += amount;
 													let _ = conn.execute(
 														"UPDATE inputs SET status = 'spent' WHERE txid = ?1 AND vout = ?2",
 														params![input.txid, input.vout],
 													);
 												}
 											}
+										}
+
+										for (vout, (output_address, amount)) in raw_tx.outputs.iter().enumerate() {
+											if output_address == &address {
+												total_received += *amount as i64;
+												if let Some(ref conn) = conn {
+													insert_input(
+														conn, 
+														&tx_hash, 
+														vout as u32, 
+														*amount, 
+														"unconfirmed",
+														Some(&block.hash),
+														Some(block.height),
+													);
+													let balance = get_balance(conn);
+												}
+											}
+										}
+
+										let net = total_received as i64 - total_spent as i64;
+										if net != 0 {
+											let sign = if net > 0 { "+" } else { "" };
+											println!("{}: {}{} OMI", tx_hash, sign, net as f64 / 100_000_000.0);
+										}
+
 										}
 									}
 								}
@@ -1168,11 +1194,12 @@ async fn main() {
 					}
 				}
 			}
-			Err(_) => {
-				std::thread::sleep(std::time::Duration::from_secs(30));
+			Err(e) => {
+				//tokio::time::sleep(Duration::from_secs(1)).await;
+				std::thread::sleep(std::time::Duration::from_secs(1));
 			}
 		}
 
-		std::thread::sleep(std::time::Duration::from_secs(5));
+		std::thread::sleep(std::time::Duration::from_secs(1));
 	}
 }
